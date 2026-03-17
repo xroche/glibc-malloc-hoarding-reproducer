@@ -141,6 +141,13 @@ pages is `malloc_trim()`, which calls `madvise(MADV_DONTNEED)` on the
 page-aligned interior of free chunks. But `malloc_trim` is never called
 automatically.
 
+## Tentative patch
+
+A tentative glibc patch is in the [`patch/`](patch/) directory. It adds a
+tunable `glibc.malloc.madvise_threshold` that makes `free()` call
+`madvise(MADV_DONTNEED)` on interior free chunks above the threshold. With
+threshold=64K, the reproducer RSS drops from 1247 MB to 296 MB.
+
 ## AI disclosure
 
 This reproducer was written with AI assistance (Claude). The author reviewed

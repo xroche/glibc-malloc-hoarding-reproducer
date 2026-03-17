@@ -1,0 +1,156 @@
+diff --git a/elf/dl-tunables.list b/elf/dl-tunables.list
+index 040a544c0e..6622ab8955 100644
+--- a/elf/dl-tunables.list
++++ b/elf/dl-tunables.list
+@@ -79,6 +79,11 @@ glibc {
+       type: SIZE_T
+       minval: 0
+     }
++    madvise_threshold {
++      type: SIZE_T
++      default: 0
++      minval: 0
++    }
+   }
+ 
+   rtld {
+diff --git a/malloc/Makefile b/malloc/Makefile
+index fef5021298..c30266f3d9 100644
+--- a/malloc/Makefile
++++ b/malloc/Makefile
+@@ -72,6 +72,7 @@ tests := \
+   tst-tcfree2 \
+   tst-tcfree3 \
+   tst-tcfree4 \
++  tst-madvise-threshold \
+   tst-trim1 \
+   tst-valloc \
+ # tests
+@@ -120,6 +121,7 @@ tests-exclude-malloc-check = \
+   tst-memalign-2 \
+   tst-memalign-3 \
+   tst-safe-linking \
++  tst-madvise-threshold \
+   tst-tcfree4 \
+ # tests-exclude-malloc-check
+ 
+@@ -140,6 +142,7 @@ tests-exclude-hugetlb1 = \
+   tst-malloc-tcache-leak \
+   tst-malloc-usable \
+   tst-malloc-usable-tunables \
++  tst-madvise-threshold \
+   tst-mallocfork2 \
+   tst-mallocfork3 \
+   tst-mallocstate \
+@@ -164,6 +167,7 @@ tests-exclude-largetcache = \
+   tst-malloc-backtrace \
+   tst-malloc-usable \
+   tst-malloc-usable-tunables \
++  tst-madvise-threshold \
+   tst-mallocstate \
+ # tests-exclude-largetcache
+ 
+@@ -187,6 +191,7 @@ tests-exclude-mcheck = \
+   tst-malloc-thread-exit \
+   tst-malloc-thread-fail \
+   tst-malloc-usable-tunables \
++  tst-madvise-threshold \
+   tst-malloc_info \
+   tst-mallocfork2 \
+   tst-mallocfork3 \
+@@ -314,6 +319,7 @@ tests-exclude-threaded = \
+   $(tests-static) \
+   tst-compathooks-on \
+   tst-interpose-nothread \
++  tst-madvise-threshold \
+   tst-mallocfork \
+ # tests-exclude-threaded
+ 
+@@ -449,6 +455,7 @@ tst-malloc-usable-threaded-worker-ENV = $(malloc-check-env)
+ tst-malloc-usable-tunables-ENV = $(malloc-check-tunables-env)
+ tst-malloc-usable-tunables-threaded-main-ENV = $(malloc-check-tunables-env)
+ tst-malloc-usable-tunables-threaded-worker-ENV = $(malloc-check-tunables-env)
++tst-madvise-threshold-ENV = GLIBC_TUNABLES=glibc.malloc.madvise_threshold=65536
+ 
+ CPPFLAGS-malloc-debug.c += -DUSE_TCACHE=0
+ CPPFLAGS-malloc.c += -DUSE_TCACHE=1
+diff --git a/malloc/arena.c b/malloc/arena.c
+index 75f2f32b5f..cf851b1c2f 100644
+--- a/malloc/arena.c
++++ b/malloc/arena.c
+@@ -240,6 +240,7 @@ TUNABLE_CALLBACK_FNDECL (set_tcache_max, size_t)
+ TUNABLE_CALLBACK_FNDECL (set_tcache_count, size_t)
+ #endif
+ TUNABLE_CALLBACK_FNDECL (set_hugetlb, size_t)
++TUNABLE_CALLBACK_FNDECL (set_madvise_threshold, size_t)
+ 
+ #if USE_TCACHE
+ static void tcache_key_initialize (void);
+@@ -300,6 +301,8 @@ __ptmalloc_init (void)
+   TUNABLE_GET (tcache_count, size_t, TUNABLE_CALLBACK (set_tcache_count));
+ # endif
+   TUNABLE_GET (hugetlb, size_t, TUNABLE_CALLBACK (set_hugetlb));
++  TUNABLE_GET (madvise_threshold, size_t,
++	       TUNABLE_CALLBACK (set_madvise_threshold));
+ 
+   if (mp_.hp_pagesize > 0 && mp_.hp_pagesize <= heap_max_size ())
+     {
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index 6455a1b0e0..cd6357e77d 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -1789,6 +1789,11 @@ struct malloc_par
+   /* Maximum number of chunks in each bucket.  */
+   size_t tcache_count;
+ #endif
++
++  /* Minimum consolidated free chunk size (in bytes) to trigger
++     madvise(MADV_DONTNEED) on the chunk's page-aligned interior
++     during free().  0 disables (the default).  */
++  size_t madvise_threshold;
+ };
+ 
+ /* There are several instances of this struct ("arenas") in this
+@@ -4416,6 +4421,28 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
+       set_head(p, size | PREV_INUSE);
+       set_foot(p, size);
+ 
++      /* If madvise_threshold is set and the consolidated chunk is
++	 large enough, release its page-aligned interior back to the
++	 kernel via MADV_DONTNEED.  Without this, interior free chunks
++	 retain their physical pages indefinitely because top-chunk
++	 trimming only operates on the heap boundary.  */
++      if (__glibc_unlikely (mp_.madvise_threshold > 0)
++	  && size >= mp_.madvise_threshold)
++	{
++	  size_t ps = GLRO (dl_pagesize);
++
++	  /* Skip past the chunk header (sizeof(struct malloc_chunk) = 48
++	     bytes on 64-bit) to preserve the bin list pointers (fd, bk,
++	     fd_nextsize, bk_nextsize), then round up to a page boundary.  */
++	  char *paligned_mem = PTR_ALIGN_UP ((char *) p
++					     + sizeof (struct malloc_chunk),
++					     ps);
++	  char *pend = PTR_ALIGN_DOWN ((char *) p + size, ps);
++
++	  if (pend > paligned_mem)
++	    __madvise (paligned_mem, pend - paligned_mem, MADV_DONTNEED);
++	}
++
+       check_free_chunk(av, p);
+     }
+   else
+@@ -5032,6 +5059,13 @@ do_set_hugetlb (size_t value)
+   return 0;
+ }
+ 
++static __always_inline int
++do_set_madvise_threshold (size_t value)
++{
++  mp_.madvise_threshold = value;
++  return 1;
++}
++
+ int
+ __libc_mallopt (int param_number, int value)
+ {
