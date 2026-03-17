@@ -141,6 +141,11 @@ pages is `malloc_trim()`, which calls `madvise(MADV_DONTNEED)` on the
 page-aligned interior of free chunks. But `malloc_trim` is never called
 automatically.
 
+## AI disclosure
+
+This reproducer was written with AI assistance (Claude). The author reviewed
+and tested all code.
+
 ## License
 
-This reproducer is public domain. Use it however you want.
+MIT. See [LICENSE](LICENSE).
