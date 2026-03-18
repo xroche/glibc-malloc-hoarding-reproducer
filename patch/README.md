@@ -1,7 +1,8 @@
 # Tentative patches
 
-Three patch variants against glibc trunk (2.43.9000, commit dd5ebf3ed8).
-All are `git apply`-ready.
+Four patch variants against glibc trunk (2.43.9000, commit dd5ebf3ed8).
+All are `git apply`-ready. Only `malloc/malloc.c` is modified (except
+patch 1 which also adds a tunable and test).
 
 ## Regression context
 
@@ -10,69 +11,63 @@ Bisect shows the memory hoarding regression was introduced in **glibc 2.26**
 to trigger `systrim`/`heap_trim`. tcache bypasses consolidation, so freed
 chunks never merge past the trimming threshold.
 
-## Patch 1: opt-in tunable (conservative)
+## Patch 1: opt-in tunable
 
 `0001-malloc-add-madvise_threshold-tunable.patch`
 
-Adds `glibc.malloc.madvise_threshold`. When set to a positive value, `free()`
-calls `madvise(MADV_DONTNEED)` on the page-aligned interior of consolidated
-free chunks above the threshold. Disabled by default.
+Adds `glibc.malloc.madvise_threshold`. Disabled by default. 96% recovery
+when enabled, but requires user configuration.
 
-Changes: `elf/dl-tunables.list`, `malloc/malloc.c`, `malloc/arena.c`,
-`malloc/Makefile`, `malloc/tst-madvise-threshold.c` (new test).
-
-## Patch 2: default-on, madvise every large chunk
+## Patch 2: madvise every large chunk
 
 `0002-malloc-madvise-interior-chunks-default-on.patch`
 
-Adds the madvise call in `_int_free_maybe_trim`, gated by the existing
-`ATTEMPT_TRIMMING_THRESHOLD` (64 KB). No tunable, no configuration.
+Madvise on every consolidated chunk >= 64 KB. Best recovery (96%), but
+causes 999K madvise calls when a million adjacent small blocks are freed
+sequentially.
 
-Best RSS recovery, but triggers a madvise syscall on every large consolidated
-free. Freeing many adjacent small blocks that merge progressively causes
-excessive madvise calls (see benchmark below).
-
-Changes: `malloc/malloc.c` only.
-
-## Patch 3: default-on, batched via per-arena accumulator (recommended)
+## Patch 3: per-arena accumulator only
 
 `0003-malloc-madvise-with-accumulator.patch`
 
-Tracks cumulative freed bytes (before consolidation) per arena. Only fires
-madvise when the accumulator crosses 128 KB AND the consolidated chunk is
->= 64 KB. Resets the accumulator after each madvise.
+Batches madvise via a cumulative freed-bytes counter. Fixes the small-blocks
+madvise storm, but only recovers 55% of hoarded memory (only one chunk is
+madvised per accumulator trigger).
 
-Accumulating the original freed size (not the merged result) is what prevents
-the madvise storm: a million 100-byte frees grow the accumulator at 100 bytes
-per call, not at the progressively larger consolidated size.
+## Patch 4: hybrid page-gate + accumulator (recommended)
 
-Changes: `malloc/malloc.c` only.
+`0004-malloc-madvise-hybrid.patch`
 
-## Results with the reproducer
+Two triggers in `_int_free_maybe_trim`:
+- Immediate: freed block >= page size. Covers medium/large frees.
+- Deferred: sub-page frees accumulate per arena; when the counter crosses
+  256 KB, the next large consolidated chunk is madvised.
+
+86% recovery, and only 426 madvise calls on the million-small-blocks case
+(vs 999K for patch 2). Strictly better than patch 3 at the same cost.
+
+## Results
 
 16 threads, 256 MB live data, 10 GB query throughput.
 
 ```
-                      Baseline    Patch 1     Patch 2     Patch 3
-                                  (tunable)   (every)     (batched)
-RSS after free():     1247 MB     296 MB      296 MB      707 MB
-Live data:            261 MB      261 MB      261 MB      261 MB
-malloc_trim recovery: 962 MB      14 MB       14 MB       424 MB
-Runtime:              0.37s       0.50s       0.52s       0.47s
+                      Baseline  Patch 1   Patch 2   Patch 3   Patch 4
+                                (tunable) (every)   (accum)   (hybrid)
+RSS after free():     1247 MB   296 MB    296 MB    707 MB    397 MB
+Recovery:             0%        96%       96%       55%       86%
+malloc_trim leftover: 962 MB    14 MB     14 MB     424 MB    114 MB
+Runtime:              0.37s     0.50s     0.52s     0.47s     0.51s
 ```
 
-## Adversarial workloads
-
-Sequential free of adjacent blocks (Wilco's concern, BZ #33886 comment 10):
+Adversarial workloads (sequential free of adjacent blocks):
 
 ```
-                      Baseline    Patch 2     Patch 3
-1M x 100B free:       10 ms       TBD         30 ms       (0 madvise calls)
-100K x 8KB free:      7.8 ms      177 ms      72 ms
-  madvise calls:      0           99,603      6,250
+                      Baseline  Patch 2   Patch 3   Patch 4
+1M x 100B free:       10 ms     1506 ms   30 ms     22 ms
+  madvise calls:      0         999,399   0         426
+100K x 8KB free:      7.8 ms    233 ms    72 ms     236 ms
+  madvise calls:      0         99,603    6,250     99,993
 ```
-
-Patch 3 reduces madvise calls by 16x vs patch 2 on the 8 KB sequential case.
 
 ## Apply and build
 
@@ -83,6 +78,7 @@ cd /path/to/glibc
 git apply patch/0001-malloc-add-madvise_threshold-tunable.patch
 git apply patch/0002-malloc-madvise-interior-chunks-default-on.patch
 git apply patch/0003-malloc-madvise-with-accumulator.patch
+git apply patch/0004-malloc-madvise-hybrid.patch
 
 # Build:
 mkdir -p ../glibc-build && cd ../glibc-build
