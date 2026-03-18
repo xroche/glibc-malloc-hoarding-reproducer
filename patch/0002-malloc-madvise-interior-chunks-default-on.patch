@@ -1,53 +1,42 @@
-From: Xavier Roche <xavier.roche@algolia.com>
-Subject: [PATCH] malloc: release physical pages from large interior free chunks
-
-Since glibc 2.26 (tcache introduction), free() no longer returns
-physical memory for interior heap chunks. tcache intercepts freed
-chunks before consolidation, preventing the merge-and-trim path that
-previously returned memory via systrim/heap_trim.
-
-Extend _int_free_maybe_trim to call madvise(MADV_DONTNEED) on the
-page-aligned interior of consolidated free chunks that already exceed
-ATTEMPT_TRIMMING_THRESHOLD (64 KB). This code path already calls
-systrim and heap_trim (both syscalls), so one additional madvise is
-not a new class of overhead.
-
-The signature of _int_free_maybe_trim gains a chunk pointer parameter
-so it can compute the madvise region. The only call site already has
-the pointer in scope.
-
-AI disclosure: AI tools (Claude) were used during research, analysis,
-and patch drafting. The author reviewed and tested everything. The
-patch logic reuses the existing mtrim() page-alignment pattern.
-
-Signed-off-by: Xavier Roche <xavier.roche@algolia.com>
----
- malloc/malloc.c | 20 ++++++++++++++++++--
- 1 file changed, 18 insertions(+), 2 deletions(-)
-
 diff --git a/malloc/malloc.c b/malloc/malloc.c
-index 6455a1b0e0..XXXX 100644
+index 6455a1b0e0..e5a9929f36 100644
 --- a/malloc/malloc.c
 +++ b/malloc/malloc.c
-@@ -4434,8 +4434,9 @@ _int_free_create_chunk (...)
+@@ -1029,7 +1029,7 @@ static void _int_free_merge_chunk (mstate, mchunkptr, INTERNAL_SIZE_T);
+ static INTERNAL_SIZE_T _int_free_create_chunk (mstate,
+ 					       mchunkptr, INTERNAL_SIZE_T,
+ 					       mchunkptr, INTERNAL_SIZE_T);
+-static void _int_free_maybe_trim (mstate, INTERNAL_SIZE_T);
++static void _int_free_maybe_trim (mstate, mchunkptr, INTERNAL_SIZE_T);
+ static void*  _int_realloc(mstate, mchunkptr, INTERNAL_SIZE_T,
+ 			   INTERNAL_SIZE_T);
+ static void*  _int_memalign(mstate, size_t, size_t);
+@@ -4352,7 +4352,7 @@ _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
+ 
+   /* Write the chunk header, maybe after merging with the following chunk.  */
+   size = _int_free_create_chunk (av, p, size, nextchunk, nextsize);
+-  _int_free_maybe_trim (av, size);
++  _int_free_maybe_trim (av, p, size);
+ }
+ 
+ /* Create a chunk at P of SIZE bytes, with SIZE potentially increased
+@@ -4434,12 +4434,25 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
  /* If the total unused topmost memory exceeds trim threshold, ask malloc_trim
     to reduce top.  */
  static void
 -_int_free_maybe_trim (mstate av, INTERNAL_SIZE_T size)
 +_int_free_maybe_trim (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
  {
-+
    /* We don't want to trim on each free.  As a compromise, trimming is attempted
       if ATTEMPT_TRIMMING_THRESHOLD is reached.  */
    if (size >= ATTEMPT_TRIMMING_THRESHOLD)
-@@ -4443,6 +4444,21 @@ _int_free_maybe_trim (mstate av, INTERNAL_SIZE_T size)
+     {
 +      /* Release physical pages from the interior of this free chunk.
-+	 Without this, interior chunks retain their physical pages
-+	 indefinitely because top-chunk trimming only operates on the
-+	 heap boundary.  This was not a problem before glibc 2.26 because
-+	 fastbin consolidation created large enough regions for the trim
-+	 path to work.  tcache broke that by intercepting free() before
-+	 consolidation.  */
++	 Before glibc 2.26 (tcache), fastbin consolidation produced free
++	 regions large enough for systrim/heap_trim to return memory.
++	 tcache bypasses consolidation, so interior chunks now retain
++	 their pages indefinitely.  This madvise restores the pre-tcache
++	 memory-return behavior.  */
 +      size_t ps = GLRO (dl_pagesize);
 +      char *paligned = PTR_ALIGN_UP ((char *) p
 +				     + sizeof (struct malloc_chunk), ps);
@@ -58,10 +47,12 @@ index 6455a1b0e0..XXXX 100644
        if (av == &main_arena)
  	{
  #ifndef MORECORE_CANNOT_TRIM
-@@ -4355,7 +4371,7 @@ _int_free_merge_chunk (...)
-
-   /* Write the chunk header, maybe after merging with the following chunk.  */
-   size = _int_free_create_chunk (av, p, size, nextchunk, nextsize);
--  _int_free_maybe_trim (av, size);
-+  _int_free_maybe_trim (av, p, size);
- }
+@@ -4648,7 +4661,7 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
+       set_head_size (p, nb);
+       size = _int_free_create_chunk (av, remainder, size - nb, nextchunk,
+ 				     chunksize (nextchunk));
+-      _int_free_maybe_trim (av, size);
++      _int_free_maybe_trim (av, remainder, size);
+     }
+ 
+   check_inuse_chunk (av, p);
