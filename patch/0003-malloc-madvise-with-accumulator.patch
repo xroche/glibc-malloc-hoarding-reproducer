@@ -1,0 +1,118 @@
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index 6455a1b0e0..3f3196dc57 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -1029,7 +1029,8 @@ static void _int_free_merge_chunk (mstate, mchunkptr, INTERNAL_SIZE_T);
+ static INTERNAL_SIZE_T _int_free_create_chunk (mstate,
+ 					       mchunkptr, INTERNAL_SIZE_T,
+ 					       mchunkptr, INTERNAL_SIZE_T);
+-static void _int_free_maybe_trim (mstate, INTERNAL_SIZE_T);
++static void _int_free_maybe_trim (mstate, mchunkptr, INTERNAL_SIZE_T,
++				  INTERNAL_SIZE_T);
+ static void*  _int_realloc(mstate, mchunkptr, INTERNAL_SIZE_T,
+ 			   INTERNAL_SIZE_T);
+ static void*  _int_memalign(mstate, size_t, size_t);
+@@ -1691,6 +1692,17 @@ unlink_chunk (mstate av, mchunkptr p)
+ 
+ #define ATTEMPT_TRIMMING_THRESHOLD  (65536UL)
+ 
++/*
++   MADVISE_PURGE_THRESHOLD is the cumulative number of bytes freed in an
++   arena before we call madvise(MADV_DONTNEED) on the next consolidated
++   chunk that reaches ATTEMPT_TRIMMING_THRESHOLD.  Batching prevents
++   excessive madvise syscalls when many adjacent small blocks are freed.
++   Set to 4x the minimum heap size (HEAP_MIN_SIZE is 32 KB), so we
++   accumulate a meaningful amount of freed memory before purging.
++ */
++
++#define MADVISE_PURGE_THRESHOLD  (4 * 32 * 1024UL)
++
+ /*
+    NONCONTIGUOUS_BIT indicates that MORECORE does not return contiguous
+    regions.  Otherwise, contiguity is exploited in merging together,
+@@ -1747,6 +1759,11 @@ struct malloc_state
+   /* Memory allocated from the system in this arena.  */
+   INTERNAL_SIZE_T system_mem;
+   INTERNAL_SIZE_T max_system_mem;
++
++  /* Cumulative bytes freed since the last madvise pass on this arena.
++     When this exceeds MADVISE_PURGE_THRESHOLD, the next large-enough
++     free triggers madvise(MADV_DONTNEED) on the consolidated chunk.  */
++  INTERNAL_SIZE_T madvise_accumulator;
+ };
+ 
+ struct malloc_par
+@@ -4315,6 +4332,7 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
+ static void
+ _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
+ {
++  INTERNAL_SIZE_T orig_size = size;
+   mchunkptr nextchunk = chunk_at_offset(p, size);
+ 
+   check_inuse_chunk (av, p);
+@@ -4352,7 +4370,7 @@ _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
+ 
+   /* Write the chunk header, maybe after merging with the following chunk.  */
+   size = _int_free_create_chunk (av, p, size, nextchunk, nextsize);
+-  _int_free_maybe_trim (av, size);
++  _int_free_maybe_trim (av, p, orig_size, size);
+ }
+ 
+ /* Create a chunk at P of SIZE bytes, with SIZE potentially increased
+@@ -4432,14 +4450,45 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
+ }
+ 
+ /* If the total unused topmost memory exceeds trim threshold, ask malloc_trim
+-   to reduce top.  */
++   to reduce top.  Also, if enough memory has been freed in this arena since
++   the last madvise, release the physical pages of the consolidated chunk.  */
+ static void
+-_int_free_maybe_trim (mstate av, INTERNAL_SIZE_T size)
++_int_free_maybe_trim (mstate av, mchunkptr p,
++		      INTERNAL_SIZE_T orig_size, INTERNAL_SIZE_T size)
+ {
++  /* Track cumulative bytes freed (before consolidation) in this arena.
++     When the accumulator crosses MADVISE_PURGE_THRESHOLD and the
++     consolidated chunk is large enough, call madvise(MADV_DONTNEED)
++     on its page-aligned interior.
++
++     Before glibc 2.26 (tcache), fastbin consolidation produced regions
++     large enough for systrim/heap_trim to return memory.  tcache
++     bypasses consolidation, so interior chunks now retain their pages
++     indefinitely.  The accumulator batches madvise calls so that
++     freeing many small adjacent blocks doesn't cause a syscall per
++     free.  We accumulate orig_size (the size before consolidation)
++     rather than the consolidated size, so that a million 100-byte
++     frees accumulate at 100 bytes each, not at the growing merged
++     size.  */
++  av->madvise_accumulator += orig_size;
++
+   /* We don't want to trim on each free.  As a compromise, trimming is attempted
+      if ATTEMPT_TRIMMING_THRESHOLD is reached.  */
+   if (size >= ATTEMPT_TRIMMING_THRESHOLD)
+     {
++      if (av->madvise_accumulator >= MADVISE_PURGE_THRESHOLD)
++	{
++	  size_t ps = GLRO (dl_pagesize);
++	  char *paligned = PTR_ALIGN_UP ((char *) p
++					 + sizeof (struct malloc_chunk), ps);
++	  char *pend = PTR_ALIGN_DOWN ((char *) p + size, ps);
++	  if (pend > paligned)
++	    {
++	      __madvise (paligned, pend - paligned, MADV_DONTNEED);
++	      av->madvise_accumulator = 0;
++	    }
++	}
++
+       if (av == &main_arena)
+ 	{
+ #ifndef MORECORE_CANNOT_TRIM
+@@ -4648,7 +4697,7 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
+       set_head_size (p, nb);
+       size = _int_free_create_chunk (av, remainder, size - nb, nextchunk,
+ 				     chunksize (nextchunk));
+-      _int_free_maybe_trim (av, size);
++      _int_free_maybe_trim (av, remainder, size - nb, size);
+     }
+ 
+   check_inuse_chunk (av, p);
