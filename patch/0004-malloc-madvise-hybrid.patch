@@ -1,5 +1,5 @@
 diff --git a/malloc/malloc.c b/malloc/malloc.c
-index 6455a1b0e0..b840442c0f 100644
+index 6455a1b0e0..ea2ebe259a 100644
 --- a/malloc/malloc.c
 +++ b/malloc/malloc.c
 @@ -1029,7 +1029,8 @@ static void _int_free_merge_chunk (mstate, mchunkptr, INTERNAL_SIZE_T);
@@ -51,7 +51,7 @@ index 6455a1b0e0..b840442c0f 100644
  }
  
  /* Create a chunk at P of SIZE bytes, with SIZE potentially increased
-@@ -4432,14 +4442,43 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
+@@ -4432,14 +4442,38 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
  }
  
  /* If the total unused topmost memory exceeds trim threshold, ask malloc_trim
@@ -68,14 +68,9 @@ index 6455a1b0e0..b840442c0f 100644
      {
 +      size_t ps = GLRO (dl_pagesize);
 +
-+      /* Release physical pages from the consolidated chunk's interior.
-+	 Two triggers:
-+	 - Immediate: the freed block was large enough to contain whole
-+	   pages (orig_size >= ps + header).  Covers medium/large frees.
-+	 - Deferred: sub-page frees accumulate in the arena counter;
-+	   when it crosses MADVISE_PURGE_THRESHOLD, the next large
-+	   consolidated chunk is madvised.  Covers the case where many
-+	   small frees consolidate into large free regions.  */
++      /* Madvise the consolidated chunk's interior if the freed block
++	 could contain whole pages, or if enough sub-page frees have
++	 accumulated since the last madvise.  */
 +      bool do_madvise
 +	= (orig_size >= ps + sizeof (struct malloc_chunk));
 +      if (!do_madvise)
@@ -99,7 +94,7 @@ index 6455a1b0e0..b840442c0f 100644
        if (av == &main_arena)
  	{
  #ifndef MORECORE_CANNOT_TRIM
-@@ -4646,9 +4685,10 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
+@@ -4646,9 +4680,10 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
        mchunkptr nextchunk = chunk_at_offset (p, size);
        mchunkptr remainder = chunk_at_offset (p, nb);
        set_head_size (p, nb);
