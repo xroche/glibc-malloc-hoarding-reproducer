@@ -1,8 +1,16 @@
-# Tentative patches
+# Patch iterations
 
-Four patch variants against glibc trunk (2.43.9000, commit dd5ebf3ed8).
-All are `git apply`-ready. Only `malloc/malloc.c` is modified (except
-patch 1 which also adds a tunable and test).
+Four patch variants against glibc trunk (2.43.9000).  Patch 4 is the
+current one, sent to libc-alpha on 2026-04-21 under
+`<cover.1776760573.git.xavier.roche@algolia.com>`.  Patches 1-3 are
+earlier iterations, kept for design-discussion reference; they do not
+apply cleanly against current trunk.
+
+Patch 4 modifies `malloc/malloc.c`, registers a new test
+`tst-madvise-threshold` in `malloc/Makefile`, and adds
+`malloc/tst-madvise-threshold.c` (which validates RSS recovery by
+asserting free() returns at least half of the filler memory to the OS).
+Patches 1-3 touch fewer files (patch 1 also adds a tunable).
 
 ## Regression context
 
@@ -69,25 +77,24 @@ Adversarial workloads (sequential free of adjacent blocks):
   madvise calls:      0         99,603    6,250     99,993
 ```
 
-## Apply and build
+## Apply and build (patch 4)
 
 ```sh
-cd /path/to/glibc
+cd /path/to/glibc  # fresh checkout of master
 
-# Pick one:
-git apply patch/0001-malloc-add-madvise_threshold-tunable.patch
-git apply patch/0002-malloc-madvise-interior-chunks-default-on.patch
-git apply patch/0003-malloc-madvise-with-accumulator.patch
-git apply patch/0004-malloc-madvise-hybrid.patch
+git am patch/0004-malloc-madvise-hybrid.patch    # or `git apply` for just the diff
 
-# Build:
 mkdir -p ../glibc-build && cd ../glibc-build
 ../glibc/configure --prefix=/usr
 make -j$(nproc)
 
-# Test (patch 1 only):
+# Run the bundled test (included by patch 4):
 make test t=malloc/tst-madvise-threshold
 ```
+
+Patches 1-3 are archival; rebase against current trunk if you want
+to compare behaviour.  The headline benchmark numbers in the table
+above still reflect their respective designs.
 
 ## AI disclosure
 

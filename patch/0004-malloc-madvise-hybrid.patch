@@ -1,5 +1,66 @@
+From b8462f215aa1e4f7ad5adbba9337d57cc3ee4a7b Mon Sep 17 00:00:00 2001
+From: Xavier Roche <xavier.roche@algolia.com>
+Date: Mon, 20 Apr 2026 19:16:04 +0200
+Subject: [PATCH] malloc: madvise interior free chunks above a threshold
+
+Since glibc 2.26 introduced tcache, free() no longer returns
+physical pages to the kernel for chunks that sit in the interior
+of an arena heap.  malloc_trim(0) still recovers the memory, but
+free() itself cannot.  A bisect between 2.25 and 2.26 shows a 4x
+RSS regression on a reproducer that interleaves long-lived index
+data with short-lived filler allocations.
+
+Extend _int_free_maybe_trim to madvise the page-aligned interior
+of consolidated chunks >= ATTEMPT_TRIMMING_THRESHOLD (64 KB),
+using the same page-alignment logic as mtrim.  To avoid a flood
+of madvise calls when many small frees merge into one chunk (the
+concern raised by Wilco on BZ #33886 comment 10), gate the call
+on the caller's pre-consolidation size: direct madvise when that
+size already covers a full page, accumulator-batched madvise
+(fires every MADVISE_PURGE_THRESHOLD = 256 KB of sub-page frees)
+otherwise.
+
+The per-arena accumulator is read and written only under the
+arena mutex, which is held by both call sites
+(_int_free_merge_chunk and _int_memalign).
+
+Advice type is MADV_FREE for moderate chunks and MADV_DONTNEED
+for chunks >= 2 * ATTEMPT_TRIMMING_THRESHOLD.  MADV_DONTNEED
+matches the existing mtrim behavior and gives operators the
+predictable RSS drop they expect; MADV_FREE amortises the
+per-page cost for moderate chunks that are likely to be reused.
+
+Reproducer (tst-madvise-threshold): 16 threads, 256 MB live
+data, 10 GB short-lived churn.
+
+  RSS after free, before:  1247 MB
+  RSS after free, after:    296 MB
+  Runtime overhead:        +0.16 s on a tight malloc/free loop.
+
+Related: BZ #15321, #18910, #27976, #33886.
+
+Signed-off-by: Xavier Roche <xavier.roche@algolia.com>
+---
+ malloc/Makefile                |   1 +
+ malloc/malloc.c                |  61 +++++++++++++---
+ malloc/tst-madvise-threshold.c | 128 +++++++++++++++++++++++++++++++++
+ 3 files changed, 182 insertions(+), 8 deletions(-)
+ create mode 100644 malloc/tst-madvise-threshold.c
+
+diff --git a/malloc/Makefile b/malloc/Makefile
+index fef5021298..d663454e57 100644
+--- a/malloc/Makefile
++++ b/malloc/Makefile
+@@ -39,6 +39,7 @@ tests := \
+   tst-free-sized-trace \
+   tst-interpose-nothread \
+   tst-interpose-thread \
++  tst-madvise-threshold \
+   tst-mallinfo2 \
+   tst-malloc \
+   tst-malloc-alternate-path \
 diff --git a/malloc/malloc.c b/malloc/malloc.c
-index 6455a1b0e0..ea2ebe259a 100644
+index 57b58382b1..d20e22a463 100644
 --- a/malloc/malloc.c
 +++ b/malloc/malloc.c
 @@ -1029,7 +1029,8 @@ static void _int_free_merge_chunk (mstate, mchunkptr, INTERNAL_SIZE_T);
@@ -12,7 +73,7 @@ index 6455a1b0e0..ea2ebe259a 100644
  static void*  _int_realloc(mstate, mchunkptr, INTERNAL_SIZE_T,
  			   INTERNAL_SIZE_T);
  static void*  _int_memalign(mstate, size_t, size_t);
-@@ -1691,6 +1692,11 @@ unlink_chunk (mstate av, mchunkptr p)
+@@ -1691,6 +1692,18 @@ unlink_chunk (mstate av, mchunkptr p)
  
  #define ATTEMPT_TRIMMING_THRESHOLD  (65536UL)
  
@@ -21,10 +82,17 @@ index 6455a1b0e0..ea2ebe259a 100644
 +
 +#define MADVISE_PURGE_THRESHOLD  (4 * ATTEMPT_TRIMMING_THRESHOLD)
 +
++/* Consolidated chunks above this size use MADV_DONTNEED (immediate
++   page release) instead of MADV_FREE (lazy release).  Large chunks
++   are unlikely to be reused at the same size, and the immediate RSS
++   reduction is worth the higher per-call cost.  */
++
++#define MADVISE_DONTNEED_THRESHOLD  (2 * ATTEMPT_TRIMMING_THRESHOLD)
++
  /*
     NONCONTIGUOUS_BIT indicates that MORECORE does not return contiguous
     regions.  Otherwise, contiguity is exploited in merging together,
-@@ -1747,6 +1753,9 @@ struct malloc_state
+@@ -1747,6 +1760,9 @@ struct malloc_state
    /* Memory allocated from the system in this arena.  */
    INTERNAL_SIZE_T system_mem;
    INTERNAL_SIZE_T max_system_mem;
@@ -34,7 +102,7 @@ index 6455a1b0e0..ea2ebe259a 100644
  };
  
  struct malloc_par
-@@ -4315,6 +4324,7 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
+@@ -4315,6 +4331,7 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
  static void
  _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
  {
@@ -42,7 +110,7 @@ index 6455a1b0e0..ea2ebe259a 100644
    mchunkptr nextchunk = chunk_at_offset(p, size);
  
    check_inuse_chunk (av, p);
-@@ -4352,7 +4362,7 @@ _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
+@@ -4352,7 +4369,7 @@ _int_free_merge_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
  
    /* Write the chunk header, maybe after merging with the following chunk.  */
    size = _int_free_create_chunk (av, p, size, nextchunk, nextsize);
@@ -51,7 +119,7 @@ index 6455a1b0e0..ea2ebe259a 100644
  }
  
  /* Create a chunk at P of SIZE bytes, with SIZE potentially increased
-@@ -4432,14 +4442,38 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
+@@ -4432,14 +4449,41 @@ _int_free_create_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size,
  }
  
  /* If the total unused topmost memory exceeds trim threshold, ask malloc_trim
@@ -66,11 +134,12 @@ index 6455a1b0e0..ea2ebe259a 100644
 -     if ATTEMPT_TRIMMING_THRESHOLD is reached.  */
    if (size >= ATTEMPT_TRIMMING_THRESHOLD)
      {
++      /* Release interior pages of the consolidated chunk.  MADV_FREE
++	 for moderate chunks (pages kept until kernel pressure, no
++	 re-fault on quick reuse).  MADV_DONTNEED for large chunks
++	 (immediate RSS reduction, worth the cost at this size).
++	 Sub-page frees accumulate until MADVISE_PURGE_THRESHOLD.  */
 +      size_t ps = GLRO (dl_pagesize);
-+
-+      /* Madvise the consolidated chunk's interior if the freed block
-+	 could contain whole pages, or if enough sub-page frees have
-+	 accumulated since the last madvise.  */
 +      bool do_madvise
 +	= (orig_size >= ps + sizeof (struct malloc_chunk));
 +      if (!do_madvise)
@@ -86,7 +155,9 @@ index 6455a1b0e0..ea2ebe259a 100644
 +	  char *pend = PTR_ALIGN_DOWN ((char *) p + size, ps);
 +	  if (pend > paligned)
 +	    {
-+	      __madvise (paligned, pend - paligned, MADV_DONTNEED);
++	      int advice = (size >= MADVISE_DONTNEED_THRESHOLD)
++			   ? MADV_DONTNEED : MADV_FREE;
++	      __madvise (paligned, pend - paligned, advice);
 +	      av->madvise_accumulator = 0;
 +	    }
 +	}
@@ -94,7 +165,7 @@ index 6455a1b0e0..ea2ebe259a 100644
        if (av == &main_arena)
  	{
  #ifndef MORECORE_CANNOT_TRIM
-@@ -4646,9 +4680,10 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
+@@ -4646,9 +4690,10 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
        mchunkptr nextchunk = chunk_at_offset (p, size);
        mchunkptr remainder = chunk_at_offset (p, nb);
        set_head_size (p, nb);
@@ -107,3 +178,140 @@ index 6455a1b0e0..ea2ebe259a 100644
      }
  
    check_inuse_chunk (av, p);
+diff --git a/malloc/tst-madvise-threshold.c b/malloc/tst-madvise-threshold.c
+new file mode 100644
+index 0000000000..964ec0ba30
+--- /dev/null
++++ b/malloc/tst-madvise-threshold.c
+@@ -0,0 +1,128 @@
++/* Test for the glibc.malloc.madvise_threshold tunable.
++
++   Verify that when the tunable is set, free() returns physical memory
++   to the OS for interior free chunks (not just the top chunk).
++
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <malloc.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <support/check.h>
++
++/* Read RSS from /proc/self/statm in bytes.  */
++static long
++get_rss (void)
++{
++  FILE *f = fopen ("/proc/self/statm", "r");
++  if (f == NULL)
++    FAIL_UNSUPPORTED ("/proc/self/statm not available");
++
++  long pages;
++  if (fscanf (f, "%*d %ld", &pages) != 1)
++    {
++      fclose (f);
++      FAIL_UNSUPPORTED ("cannot parse /proc/self/statm");
++    }
++  fclose (f);
++  return pages * sysconf (_SC_PAGESIZE);
++}
++
++/* Number of pinning (index) allocations.  These stay alive and
++   prevent heap segments from being unmapped.  */
++#define N_INDEX 200
++
++/* Number of filler (query) allocations per round.  These are freed
++   and should have their physical pages returned when the tunable
++   is set.  */
++#define N_FILLER 2000
++
++/* Size of each filler allocation.  Must be below mmap threshold
++   so allocations go through arenas.  */
++#define FILLER_SIZE (64 * 1024)
++
++/* Size of each index allocation.  Small enough to fit between
++   filler chunks.  */
++#define INDEX_SIZE 1024
++
++static int
++do_test (void)
++{
++  void *index_ptrs[N_INDEX];
++  void *filler_ptrs[N_FILLER];
++
++  /* Phase 1: Allocate index and filler data interleaved.
++     This creates the fragmentation pattern: index chunks scattered
++     among filler chunks in the arena heaps.  */
++  int idx = 0;
++  for (int i = 0; i < N_FILLER; i++)
++    {
++      /* Every N_FILLER/N_INDEX filler allocs, insert an index alloc.  */
++      if (idx < N_INDEX && i % (N_FILLER / N_INDEX) == 0)
++	{
++	  index_ptrs[idx] = malloc (INDEX_SIZE);
++	  TEST_VERIFY_EXIT (index_ptrs[idx] != NULL);
++	  memset (index_ptrs[idx], 0xAA, INDEX_SIZE);
++	  idx++;
++	}
++
++      filler_ptrs[i] = malloc (FILLER_SIZE);
++      TEST_VERIFY_EXIT (filler_ptrs[i] != NULL);
++      memset (filler_ptrs[i], 0xBB, FILLER_SIZE);
++    }
++
++  long rss_peak = get_rss ();
++  printf ("RSS after allocation: %ld MB\n", rss_peak / (1024 * 1024));
++
++  /* Phase 2: Free all filler data.  Index data stays alive and
++     pins the heap segments, so the freed space is interior.  */
++  for (int i = 0; i < N_FILLER; i++)
++    free (filler_ptrs[i]);
++
++  long rss_after_free = get_rss ();
++  printf ("RSS after free:       %ld MB\n", rss_after_free / (1024 * 1024));
++
++  /* Phase 3: Check that RSS dropped.
++     With madvise_threshold set (via GLIBC_TUNABLES in the test
++     environment), free() calls madvise(MADV_DONTNEED) on the
++     interior of the freed chunks, so RSS should drop.
++
++     Without the tunable, RSS stays near the peak because the freed
++     memory is interior to the heap, not at the top.
++
++     We expect at least 50% of the filler memory to be returned.  */
++  long filler_bytes = (long) N_FILLER * FILLER_SIZE;
++  long recovered = rss_peak - rss_after_free;
++
++  printf ("Filler data:          %ld MB\n", filler_bytes / (1024 * 1024));
++  printf ("Recovered by free():  %ld MB\n", recovered / (1024 * 1024));
++
++  /* The threshold is set via the test environment.  If it's working,
++     we should recover at least half the filler memory.  */
++  TEST_VERIFY (recovered > filler_bytes / 2);
++
++  /* Cleanup.  */
++  for (int i = 0; i < N_INDEX; i++)
++    free (index_ptrs[i]);
++
++  return 0;
++}
++
++#include <support/test-driver.c>
+-- 
+2.43.0
+

@@ -141,12 +141,49 @@ pages is `malloc_trim()`, which calls `madvise(MADV_DONTNEED)` on the
 page-aligned interior of free chunks. But `malloc_trim` is never called
 automatically.
 
-## Tentative patch
+## Patch
 
-A tentative glibc patch is in the [`patch/`](patch/) directory. It adds a
-tunable `glibc.malloc.madvise_threshold` that makes `free()` call
-`madvise(MADV_DONTNEED)` on interior free chunks above the threshold. With
-threshold=64K, the reproducer RSS drops from 1247 MB to 296 MB.
+The current RFC patch (sent to libc-alpha on 2026-04-21) is at
+[`patch/0004-malloc-madvise-hybrid.patch`](patch/0004-malloc-madvise-hybrid.patch).
+Earlier iterations (tunable-only, default-on without accumulator, etc.) are
+preserved alongside for reference.
+
+The patch extends `_int_free_maybe_trim` to `madvise` the page-aligned
+interior of consolidated free chunks >= 64 KB, with a per-arena accumulator
+that batches sub-page frees to avoid the million-syscall scenario that
+Wilco Dijkstra raised on BZ #33886. On the reproducer RSS drops from
+1247 MB to 296 MB.
+
+## Diagnostic tooling
+
+Three complementary capture scripts to verify the bug and the fix
+independently. See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the full write-up
+with findings.
+
+| Script | What it captures | Answers |
+|---|---|---|
+| `./run-mtrace.sh` | Every `malloc`/`realloc`/`free` via `mtrace(3)` | "Is there a leak? Does the allocation pattern change?" |
+| `./run-strace.sh` | `strace -c -e madvise,brk,mmap,munmap` counts | "What syscalls does the patch actually add?" |
+| `./run-malloc-info.sh` | `malloc_info(0, fp)` XML snapshots at each phase | "Does the allocator's internal state change?" |
+
+Each script supports `--patched /path/to/glibc-build` to contrast the
+system glibc against a locally-built patched tree. All three share one
+small reproducer, [`reproducer-mtrace.c`](reproducer-mtrace.c), that
+mirrors the pattern in the full `reproducer.c` but at 125 MB rather than
+10+ GB, so the resulting traces stay shareable.
+
+Headline numbers from a recent run (Ubuntu 24.04, glibc 2.39 system,
+patched trunk):
+
+| Signal | System | Patched | Note |
+|---|---|---|---|
+| `mtrace` user-allocation diff | — | byte-identical | No leak; identical pattern |
+| `strace` madvise count | 0 | 2000 | One per 64 KB free |
+| `strace` brk / mmap | 689 / 8 | 689 / 11 | Unchanged (stdio noise) |
+| `malloc_info` phase 2 free chunks | 201 | 201 | Identical allocator state |
+| RSS after 2000 frees | 126 MB | 2 MB | 124 MB kernel-side recovery |
+
+Full reproduction in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 
 ## AI disclosure
 

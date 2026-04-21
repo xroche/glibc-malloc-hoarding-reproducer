@@ -1,0 +1,9 @@
+# Build artifacts
+reproducer
+reproducer-mtrace
+
+# Captured traces (regenerate with the run-*.sh scripts)
+*.mtrace
+*.mtrace.gz
+sys-phase*.xml
+pat-phase*.xml
